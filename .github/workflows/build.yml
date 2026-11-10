@@ -1,0 +1,143 @@
+name: Pissygram CI
+
+on:
+  workflow_dispatch:
+  # Р Р°СЃРєРѕРјРјРµРЅС‚РёСЂСѓР№, РµСЃР»Рё С…РѕС‡РµС€СЊ Р°РІС‚РѕСЃР±РѕСЂРєСѓ РїСЂРё РєР°Р¶РґРѕРј push:
+  # push:
+  #   branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-26   # РµСЃР»Рё СѓРїР°РґС‘С‚ РЅР° СЌС‚РѕРј СЂР°РЅРЅРµСЂРµ вЂ” РїРѕСЃС‚Р°РІСЊ macos-15
+    timeout-minutes: 355
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: '0'
+
+      - name: Patch branding (Darkgram -> Pissygram)
+        run: |
+          python3 - <<'PY'
+          import os, sys
+
+          REPLACEMENTS = [
+              ("Darkgram", "Pissygram"),
+              ("DarkGram", "PissyGram"),
+              ("darkgram", "pissygram"),
+          ]
+          EXTS = {".strings", ".plist", ".stringsdict", ".json", ".txt"}
+          SKIP_DIRS = {".git", "third-party", "bazel-out", "bazel-bin"}
+
+          count = 0
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+              for name in files:
+                  ext = os.path.splitext(name)[1].lower()
+                  if ext not in EXTS:
+                      continue
+                  path = os.path.join(root, name)
+                  try:
+                      with open(path, "r", encoding="utf-8") as fh:
+                          data = fh.read()
+                  except (UnicodeDecodeError, OSError):
+                      continue
+                  new = data
+                  for old, target in REPLACEMENTS:
+                      new = new.replace(old, target)
+                  if new != data:
+                      with open(path, "w", encoding="utf-8") as fh:
+                          fh.write(new)
+                      count += 1
+          print(f"Patched {count} files")
+          PY
+
+      - name: Set active Xcode path
+        run: |
+          XCODE_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["xcode"])')
+          if [ -d "/Applications/Xcode_${XCODE_VERSION}.app" ]; then
+            echo "Using pinned Xcode ${XCODE_VERSION}"
+            sudo xcode-select -s /Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer
+            echo "OVERRIDE_FLAG=" >> $GITHUB_ENV
+          else
+            echo "Pinned Xcode ${XCODE_VERSION} not found, using latest available"
+            ls /Applications | grep -i xcode || true
+            LATEST=$(ls -t /Applications | grep '^Xcode_' | head -n 1)
+            sudo xcode-select -s "/Applications/${LATEST}.app/Contents/Developer"
+            echo "OVERRIDE_FLAG=--overrideXcodeVersion" >> $GITHUB_ENV
+          fi
+
+      - name: Create canonical source directory
+        run: |
+          sudo mkdir -p /Users/Shared
+          cp -R $GITHUB_WORKSPACE /Users/Shared/
+          mv /Users/Shared/$(basename $GITHUB_WORKSPACE) /Users/Shared/pissygram-ios
+
+      - name: Build the App
+        run: |
+          set -x
+
+          SOURCE_DIR=/Users/Shared/pissygram-ios
+          BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
+
+          cd $SOURCE_DIR
+
+          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
+
+          export APP_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["app"])')
+          export COMMIT_COUNT=$(git rev-list --count HEAD)
+          export COMMIT_COUNT="$(($COMMIT_COUNT+$BUILD_NUMBER_OFFSET))"
+          export BUILD_NUMBER="$COMMIT_COUNT"
+          echo "BUILD_NUMBER=$(echo $BUILD_NUMBER)" >> $GITHUB_ENV
+          echo "APP_VERSION=$(echo $APP_VERSION)" >> $GITHUB_ENV
+          echo "COMMIT_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            build \
+            --configurationPath="build-system/appstore-configuration.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER" \
+            $OVERRIDE_FLAG
+
+      - name: Rename IPA to Pissygram
+        run: |
+          cd /Users/Shared/pissygram-ios
+          IPA=$(ls bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa | head -n 1)
+          echo "Found IPA: $IPA"
+          rm -rf strip-tmp && mkdir strip-tmp
+          cd strip-tmp
+          unzip -q "../$IPA"
+          APP=$(ls -d Payload/*.app | head -n 1)
+          PLIST="$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Pissygram" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Pissygram" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName Pissygram" "$PLIST"
+          zip -qry Pissygram.ipa Payload
+          mkdir -p ../build/artifacts
+          cp Pissygram.ipa ../build/artifacts/
+          echo "IPA=$(pwd)/Pissygram.ipa" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pissygram-${{ env.APP_VERSION }}-${{ env.BUILD_NUMBER }}
+          path: /Users/Shared/pissygram-ios/build/artifacts/Pissygram.ipa
+          retention-days: 90
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd /Users/Shared/pissygram-ios/build/artifacts
+          gh release create "build-${{ env.BUILD_NUMBER }}" \
+            "Pissygram.ipa" \
+            --title "Pissygram ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})" \
+            --notes "РќРµС„РёРЅР°Р»СЊРЅР°СЏ (unsigned) СЃР±РѕСЂРєР° Pissygram. РЈСЃС‚Р°РЅРѕРІРєР° С‡РµСЂРµР· Sideloadly / AltStore / TrollStore."
+          echo "RELEASE=https://github.com/${{ github.repository }}/releases/tag/build-${{ env.BUILD_NUMBER }}" >> $GITHUB_ENV
+
+      - name: Result
+        run: |
+          echo "Р“РѕС‚РѕРІРѕ! IPA: ${{ env.RELEASE }}"
