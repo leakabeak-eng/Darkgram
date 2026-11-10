@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-26   # РµСЃР»Рё СѓРїР°РґС‘С‚ РЅР° СЌС‚РѕРј СЂР°РЅРЅРµСЂРµ вЂ” РїРѕСЃС‚Р°РІСЊ macos-15
+    runs-on: macos-15   # macos-26 перегружен, ставим macos-15
     timeout-minutes: 355
 
     steps:
